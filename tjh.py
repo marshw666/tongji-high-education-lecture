@@ -72,12 +72,28 @@ DONE_WORDS = ("已报名", "重复", "已经报名", "请勿重复")
 LIST_WORDS = ("名单", "无报名资格", "不具备")
 
 
+PAGE_SIZE_MAX = 50
+CREDENTIAL_STATUS_TEXT = {
+    7: "讲座已下线或不存在",
+    8: "报名排队中",
+    9: "已报名",
+    10: "名额已满",
+    11: "名额释放中",
+}
+
+
 class ApiError(RuntimeError):
     pass
 
 
 class TokenExpired(ApiError):
     pass
+
+
+class SignupUnavailable(ApiError):
+    def __init__(self, status: int | None, message: str):
+        super().__init__(message)
+        self.status = status
 
 
 def _now_cn() -> datetime:
@@ -107,6 +123,10 @@ def parse_time(value: Any) -> datetime | None:
 
 def fmt_ts(ts: float) -> str:
     return datetime.fromtimestamp(ts, CN_TZ).strftime("%H:%M:%S.%f")[:-3]
+
+
+def has_signup_time(value: Any) -> bool:
+    return isinstance(value, str) and parse_time(value) is not None
 
 
 class TjLecture:
@@ -209,6 +229,9 @@ class TjLecture:
         except requests.RequestException as exc:
             raise ApiError(f"网络错误：{exc}") from exc
 
+        if resp.status_code == 401:
+            raise TokenExpired("登录已失效，请重新登录并更新登录凭证。")
+
         if resp.status_code >= 500:
             hint = (
                 "没有可用凭证（token 和 cookie 都没带）"
@@ -225,8 +248,8 @@ class TjLecture:
         except ValueError as exc:
             raise ApiError(f"返回不是 JSON：{resp.text[:300]}") from exc
 
-        if isinstance(payload, dict) and payload.get("code") == 40001:
-            raise TokenExpired("服务端返回 code=40001：登录态失效，请重新获取 token")
+        if isinstance(payload, dict) and payload.get("code") in (40001, "nologin"):
+            raise TokenExpired("登录已失效，请重新登录并更新登录凭证。")
 
         return payload
 
@@ -297,7 +320,7 @@ class TjLecture:
 
     def face_ok(self) -> bool:
         payload = self._request("GET", "/api/gj/studentwx/studentapi/GetIsFinishFace")
-        return bool(payload.get("data"))
+        return payload.get("state") == "success" and payload.get("data") is True
 
     def list_lectures(
         self,
@@ -307,6 +330,8 @@ class TjLecture:
         time_filter: int = 0,
         class_level: int = 0,
     ) -> dict[str, Any]:
+        if type(page_size) is not int or not 1 <= page_size <= PAGE_SIZE_MAX:
+            raise ApiError(f"每页条目数必须是 1–{PAGE_SIZE_MAX} 之间的整数。")
         return self._request(
             "GET",
             "/api/gj/studentwx/lecturehallapi/GetLectureHallList",
@@ -330,34 +355,43 @@ class TjLecture:
         return payload["data"]
 
     def set_credentials(self, data_id: str) -> str:
-        """现签一个报名凭证 code。"""
+        """取得学校当前允许用于该讲座报名的凭证。"""
         payload = self._request(
             "POST", "/api/gj/studentwx/studentapi/SetCredentials", form={"dataId": data_id}
         )
         if payload.get("state") != "success":
-            raise ApiError(f"SetCredentials 失败：{payload.get('msg') or payload}")
-        code = (payload.get("data") or {}).get("code")
-        if not code:
-            raise ApiError(f"SetCredentials 未返回 code：{payload}")
+            raise SignupUnavailable(None, payload.get("msg") or "获取报名资格码失败。")
+        data = payload.get("data")
+        status = data.get("status") if isinstance(data, dict) else None
+        if type(status) is not int:
+            raise SignupUnavailable(None, "学校未返回可识别的报名状态，停止提交。")
+        if status != 0:
+            label = CREDENTIAL_STATUS_TEXT.get(status) or data.get("message") or f"暂无报名资格（状态 {status}）"
+            raise SignupUnavailable(status, label)
+        code = data.get("code")
+        if not isinstance(code, str) or not code.strip():
+            raise ApiError("学校未返回有效的报名资格码。")
         return code
 
     def check_credentials(self, code: str) -> bool:
         payload = self._request(
             "POST", "/api/gj/studentwx/studentapi/GetCredentials", form={"code": code}
         )
-        return bool((payload.get("data") or {}).get("iscode"))
+        return payload.get("state") == "success" and (payload.get("data") or {}).get("iscode") is True
 
-    def signup_with_code(self, code: str) -> dict[str, Any]:
+    def signup_with_code(self, code: str, data_id: str) -> dict[str, Any]:
         return self._request(
             "POST",
             "/api/gj/studentwx/studentapi/SginInLectureHallCredentials",
-            form={"code": code},
+            form={"code": code, "dataId": data_id},
         )
 
     def signup_result(self, data_id: str) -> dict[str, Any]:
         payload = self._request(
             "POST", "/api/gj/studentwx/studentapi/GetSginInTime", form={"dataId": data_id}
         )
+        if payload.get("state") != "success":
+            raise ApiError(payload.get("msg") or "学校未能返回报名结果。")
         return payload.get("data") or {}
 
     def check(self, data_id: str | None = None) -> int:
@@ -373,15 +407,20 @@ class TjLecture:
             print(f"[✗] 登录态        失败：{exc}")
             return 2
 
-        if not me:
+        if not me.get("StudentId"):
             print("[✗] 登录态        拿不到用户信息")
             return 2
 
         print(f"[✓] 登录态        {me.get('Name')} / {me.get('StudentId')}")
 
-        in_list = me.get("IsInStudentList") is True
-        print(f"[{'✓' if in_list else '✗'}] 在可报名名单   {'是' if in_list else '否（接口会直接拒绝）'}")
-        ok = ok and in_list
+        membership = me.get("IsInStudentList")
+        if membership is True:
+            print("[✓] 在可报名名单   是")
+        elif membership == "null" and data_id:
+            print("[!] 名单状态未明确，报名时以该场讲座的资格状态为准")
+        else:
+            print("[✗] 名单字段未通过或无法核实")
+            return 2
 
         face = me.get("IsFinishPhoto") in ("1", 1, True)
         print(f"[{'✓' if face else '✗'}] 人像采集       {'已完成' if face else '未完成（报名按钮是灰的）'}")
@@ -393,6 +432,7 @@ class TjLecture:
             ok = ok and face_api
         except ApiError as exc:
             print(f"[!] 人脸校验接口   查询失败：{exc}")
+            return 2
 
         if data_id:
             try:
@@ -412,7 +452,7 @@ class TjLecture:
             print(f"[ ] 报名开放       {open_at or '无'}")
             print(f"[{'!' if already else '✓'}] 是否已报名     {already or '未报名'}")
 
-            if already:
+            if has_signup_time(already):
                 print("[✓] 结论           已经报过了")
                 return 0
             if status == 2:
@@ -450,13 +490,29 @@ class TjLecture:
             except ApiError as exc:
                 return None, f"查询结果出错：{exc}"
             state = data.get("state")
-            if state == 1:
-                when = data.get("signUpTime") or ""
+            if state == 1 and has_signup_time(data.get("signUpTime")):
+                when = data.get("signUpTime")
                 return True, f"报名成功（服务端时间 {when}）"
             if state == -1:
                 return False, "报名失败（服务端判定）"
             time.sleep(0.6)
         return None, "结果未知：仍在处理中，可稍后在“我的讲座”查看"
+
+    def confirm_signup(self, data_id: str) -> int:
+        ok, message = self.wait_signup_result(data_id)
+        print(("√ " if ok is True else "× " if ok is False else "? ") + message)
+        return 0 if ok else 1
+
+    def confirm_existing_signup(self, data_id: str) -> int:
+        try:
+            recorded_time = self.detail(data_id).get("XSSigningUp")
+        except ApiError:
+            recorded_time = None
+        if has_signup_time(recorded_time):
+            print(f"√ 已从讲座详情核实报名记录（{recorded_time}）。")
+            return 0
+        print("? 服务端提示已报名，详情中尚未核实。请到“我的讲座”查看。")
+        return 1
 
     def signup(
         self,
@@ -482,20 +538,24 @@ class TjLecture:
         print(f"  报名开放    : {detail.get('TimeSigningUp')}")
         print(f"  已报名时间  : {already or '未报名'}")
 
-        if already:
+        if has_signup_time(already):
             print("你已经报过这场了，无需重复操作。")
             return 0
 
         try:
             me = self.whoami().get("data") or {}
             print(f"  当前身份    : {me.get('Name')} / {me.get('StudentId')}")
-            if me.get("IsInStudentList") is False:
-                print("× 你不在“高等讲堂可报名名单”内，接口会拒绝报名。")
+            membership = me.get("IsInStudentList")
+            if not me.get("StudentId") or (membership is not True and membership != "null"):
+                print("× 登录身份或报名名单未通过核验。")
                 return 2
+            if membership == "null":
+                print("  名单状态未明确，报名时以该场讲座的资格状态为准。")
         except TokenExpired:
             raise
         except ApiError as exc:
-            print(f"  （读取身份失败，继续尝试：{exc}）")
+            print(f"  （读取身份失败，停止：{exc}）")
+            return 2
 
         try:
             if not self.face_ok():
@@ -503,7 +563,8 @@ class TjLecture:
                 print("  需要先在微信端/一体机完成人像采集。")
                 return 2
         except ApiError as exc:
-            print(f"  （人脸状态检查失败，继续：{exc}）")
+            print(f"  （人脸状态检查失败，停止：{exc}）")
+            return 2
 
         if dry_run:
             print("dry-run：以上检查通过，未提交报名。")
@@ -538,28 +599,44 @@ class TjLecture:
             attempt += 1
             try:
                 code = self.set_credentials(data_id)
-                resp = self.signup_with_code(code)
+            except SignupUnavailable as exc:
+                print(f"[{fmt_ts(self.now())}] #{attempt} {exc}")
+                if exc.status == 8:
+                    return self.confirm_signup(data_id)
+                if exc.status == 9:
+                    return self.confirm_existing_signup(data_id)
+                if not once and at and exc.status not in CREDENTIAL_STATUS_TEXT:
+                    remaining = at.timestamp() - self.now()
+                    if remaining > 0 and any(word in str(exc) for word in NOT_START_WORDS):
+                        time.sleep(remaining)
+                        continue
+                return 1
+            except TokenExpired:
+                raise
+            except ApiError as exc:
+                print(f"× 获取报名资格码失败，停止：{exc}")
+                return 1
+
+            try:
+                resp = self.signup_with_code(code, data_id)
             except TokenExpired:
                 raise
             except ApiError as exc:
                 print(f"[{fmt_ts(self.now())}] #{attempt} 请求异常：{exc}")
-                time.sleep(interval * 2)
-                continue
+                print("提交结果不明确，停止重试，请在“我的讲座”核对。")
+                return 1
 
             state = resp.get("state")
             msg = str(resp.get("msg") or "")
 
             if state == "success":
                 print(f"[{fmt_ts(self.now())}] #{attempt} 已受理，查询结果 ...")
-                ok, text = self.wait_signup_result(data_id)
-                print(("√ " if ok else "× ") + text)
-                return 0 if ok else 1
+                return self.confirm_signup(data_id)
 
             print(f"[{fmt_ts(self.now())}] #{attempt} 未成功：{msg or resp}")
 
             if any(word in msg for word in DONE_WORDS):
-                print("√ 服务端认为已报名，视为成功。")
-                return 0
+                return self.confirm_existing_signup(data_id)
             if any(word in msg for word in LIST_WORDS):
                 print("× 无报名资格，停止。")
                 return 2
@@ -570,14 +647,13 @@ class TjLecture:
                 print("× 报名已结束，停止。")
                 return 1
             if any(word in msg for word in NOT_START_WORDS):
+                if once:
+                    return 1
                 time.sleep(interval + random.uniform(0, 0.08))
                 continue
 
-            # 未知错误：短暂退避后重试几次，避免把服务端打爆
-            if attempt >= 8:
-                print("× 连续未知错误，停止。请核对 DataId 或稍后手动确认。")
-                return 1
-            time.sleep(min(1.0 * attempt, 3.0))
+            print("? 服务端响应不明确，停止重试，请在“我的讲座”核对。")
+            return 1
 
         print("× 超时未成功。")
         return 1
@@ -668,7 +744,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_list.add_argument("--level", type=int, default=0, choices=[0, 1, 2],
                         help="0全部 1校级 2院级")
     p_list.add_argument("--page", type=int, default=1)
-    p_list.add_argument("--page-size", type=int, default=20)
+    p_list.add_argument("--page-size", type=int, default=20,
+                        help=f"每页条目数（1–{PAGE_SIZE_MAX}，默认 20）")
     p_list.add_argument("--json", action="store_true", help="输出原始 JSON")
 
     p_detail = sub.add_parser("detail", help="查看讲座详情")
@@ -766,7 +843,7 @@ def main(argv: list[str] | None = None) -> int:
 
     except TokenExpired as exc:
         print(f"× {exc}", file=sys.stderr)
-        print("  请重新登录并更新 token（见 README）。", file=sys.stderr)
+        print("  请重新登录并更新登录凭证（见 README）。", file=sys.stderr)
         return 3
     except ApiError as exc:
         print(f"× {exc}", file=sys.stderr)
